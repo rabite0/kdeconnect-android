@@ -41,6 +41,7 @@ import android.provider.MediaStore;
 import android.support.v4.app.NotificationCompat;
 import android.support.v4.app.TaskStackBuilder;
 import android.support.v4.content.ContextCompat;
+import android.support.v4.provider.DocumentFile;
 import android.util.Log;
 import android.widget.Toast;
 
@@ -48,6 +49,7 @@ import org.kde.kdeconnect.Device;
 import org.kde.kdeconnect.Helpers.FilesHelper;
 import org.kde.kdeconnect.NetworkPackage;
 import org.kde.kdeconnect.Plugins.Plugin;
+import org.kde.kdeconnect.UserInterface.SettingsActivity;
 import org.kde.kdeconnect_tp.R;
 
 import java.io.File;
@@ -100,6 +102,8 @@ public class SharePlugin extends Plugin {
         return true;
     }
 
+    private static final int READ_REQUEST_CODE = 42;
+
     @Override
     public boolean onPackageReceived(NetworkPackage np) {
 
@@ -112,19 +116,53 @@ public class SharePlugin extends Plugin {
                 final long fileLength = np.getPayloadSize();
                 final String filename = np.getString("filename", Long.toString(System.currentTimeMillis()));
 
+                final SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
+
                 String deviceDir = FilesHelper.toFileSystemSafeName(device.getName());
-                //Get the external storage and append "/kdeconnect/DEVICE_NAME/"
-                String destinationDir = Environment.getExternalStorageDirectory().getPath();
-                destinationDir = new File(destinationDir, "kdeconnect").getPath();
-                destinationDir = new File(destinationDir, deviceDir).getPath();
+                File destinationFullPath;
+                DocumentFile destinationDocument;
 
-                //Create directories if needed
-                new File(destinationDir).mkdirs();
+                final OutputStream destinationOutput;
+                final Uri destinationUri;
+                final String mimeType;
 
-                //Append filename to the destination path
-                final File destinationFullPath = new File(destinationDir, filename);
+                if (prefs.contains("share_destination_folder_uri")) {
+                    Uri folderUri = Uri.parse(prefs.getString("share_destination_folder_uri", null));
+                    final DocumentFile destinationFolderDocument = DocumentFile.fromTreeUri(context, folderUri);
+                    String name = filename.substring(0, filename.lastIndexOf("."));
+                    mimeType = FilesHelper.getMimeTypeFromFile(filename);
+                    if (destinationFolderDocument.findFile("kdeconnect") == null) {
+                        destinationFolderDocument.createDirectory("kdeconnect");
+                    }
+                    if (destinationFolderDocument.findFile("kdeconnect").findFile(deviceDir) == null) {
+                        destinationFolderDocument.findFile("kdeconnect").createDirectory(deviceDir);
+                    }
+                    destinationDocument = destinationFolderDocument.findFile("kdeconnect")
+                                                                   .findFile(deviceDir)
+                                                                   .createFile(mimeType, name);
+                    destinationOutput = context.getContentResolver().openOutputStream(destinationDocument.getUri());
+                    destinationUri = destinationDocument.getUri();
+                } else {
+                    //Get the external storage and append "/kdeconnect/DEVICE_NAME/"
+                    String destinationDir = Environment.getExternalStorageDirectory().getPath();
+                    destinationDir = new File(destinationDir, "kdeconnect").getPath();
+                    destinationDir = new File(destinationDir, deviceDir).getPath();
 
-                //Log.e("SharePlugin", "destinationFullPath:" + destinationFullPath);
+                    //Create directories if needed
+                    new File(destinationDir).mkdirs();
+
+                    //Append filename to the destination path
+
+                    //Log.e("SharePlugin", "destinationFullPath:" + destinationFullPath);
+                    destinationFullPath = new File(destinationDir, filename);
+                    destinationOutput = new FileOutputStream(destinationFullPath.getPath());
+                    destinationUri = Uri.parse(destinationFullPath.toURI().toString());
+                    mimeType = FilesHelper.getMimeTypeFromFile(destinationFullPath.getPath());
+                }
+
+
+
+
 
                 final NotificationManager notificationManager = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
 
@@ -149,16 +187,14 @@ public class SharePlugin extends Plugin {
                 new Thread(new Runnable() {
                     @Override
                     public void run() {
-                        OutputStream output = null;
                         boolean successul = true;
                         try {
-                            output = new FileOutputStream(destinationFullPath.getPath());
                             byte data[] = new byte[1024];
                             long progress = 0, prevProgressPercentage = 0;
                             int count;
                             while ((count = input.read(data)) >= 0) {
                                 progress += count;
-                                output.write(data, 0, count);
+                                destinationOutput.write(data, 0, count);
                                 if (fileLength > 0) {
                                     if (progress >= fileLength) break;
                                     long progressPercentage = (progress * 100 / fileLength);
@@ -176,14 +212,14 @@ public class SharePlugin extends Plugin {
                                 //else Log.e("SharePlugin", "Infinite loop? :D");
                             }
 
-                            output.flush();
+                            destinationOutput.flush();
 
                         } catch (Exception e) {
                             successul = false;
                             Log.e("SharePlugin", "Receiver thread exception");
                             e.printStackTrace();
                         } finally {
-                            try { output.close(); } catch (Exception e) {}
+                            try { destinationOutput.close(); } catch (Exception e) {}
                             try { input.close(); } catch (Exception e) {}
                         }
 
@@ -192,12 +228,12 @@ public class SharePlugin extends Plugin {
 
                             //Make sure it is added to the Android Gallery
                             Intent mediaScanIntent = new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE);
-                            mediaScanIntent.setData(Uri.fromFile(destinationFullPath));
+                            mediaScanIntent.setData(destinationUri);
                             context.sendBroadcast(mediaScanIntent);
 
                             //Update the notification and allow to open the file from it
                             Intent intent = new Intent(Intent.ACTION_VIEW);
-                            intent.setDataAndType(Uri.fromFile(destinationFullPath), FilesHelper.getMimeTypeFromFile(destinationFullPath.getPath()));
+                            intent.setDataAndType(destinationUri, mimeType);
                             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                             TaskStackBuilder stackBuilder = TaskStackBuilder.create(context);
                             stackBuilder.addNextIntent(intent);
@@ -220,7 +256,7 @@ public class SharePlugin extends Plugin {
                                        .setContentIntent(resultPendingIntent);
                             }
 
-                            SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
+
                             if (prefs.getBoolean("share_notification_preference", true)) {
                                 builder.setDefaults(Notification.DEFAULT_ALL);
                             }
@@ -301,6 +337,14 @@ public class SharePlugin extends Plugin {
         }
 
         return true;
+    }
+
+    @Override
+    public void startPreferencesActivity(SettingsActivity parentActivity) {
+        Intent intent = new Intent(parentActivity, ShareSettingsActivity.class);
+        intent.putExtra("plugin_display_name", getDisplayName());
+        intent.putExtra("plugin_key", getPluginKey());
+        parentActivity.startActivity(intent);
     }
 
 
